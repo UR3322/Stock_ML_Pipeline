@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, f1_score, confusion_matrix
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 import io
@@ -45,6 +45,8 @@ def init_session_state():
             'y_preds': {},
             'current_price': None,
             'last_symbol': None,
+            'needs_imputation': False,
+            'scale_features': True,
         }
     
     # Initialize theme state if not present
@@ -953,11 +955,11 @@ def preprocessing_step():
     missing_values = df.isnull().sum()
     if missing_values.sum() > 0:
         st.dataframe(missing_values[missing_values > 0].to_frame(name="Missing Count"))
-        numeric_cols = df.select_dtypes(include=np.number).columns
-        df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
-        st.success("Missing values imputed with mean values")
+        st.info("ℹ️ Missing values will be imputed with training-set means *after* the train/test split, so no information leaks from the test set.")
+        st.session_state.pipeline['needs_imputation'] = True
     else:
         st.success("No missing values found")
+        st.session_state.pipeline['needs_imputation'] = False
     
     st.session_state.pipeline['df_processed'] = df
     st.session_state.pipeline['preprocessed'] = True
@@ -1006,14 +1008,9 @@ def feature_engineering_step():
     
     st.subheader("Feature Scaling")
     scale_features = st.checkbox("Scale features (Standardization)", value=True)
-    
+    st.session_state.pipeline['scale_features'] = scale_features
     if scale_features:
-        try:
-            scaler = StandardScaler()
-            df[features] = scaler.fit_transform(df[features])
-            st.success("Features successfully scaled!")
-        except Exception as e:
-            st.error(f"Error scaling features: {str(e)}")
+        st.info("ℹ️ Standardization will be fit on the training set *only*, after the train/test split (no data leakage).")
     
     st.subheader("Feature Correlation")
     try:
@@ -1075,6 +1072,20 @@ def train_test_split_step():
             test_size=test_size/100, 
             random_state=random_state
         )
+
+        # Impute and scale AFTER the split, using training-set statistics only.
+        # Fitting on the full dataset would leak test-set information.
+        if st.session_state.pipeline.get('needs_imputation'):
+            imputer = SimpleImputer(strategy='mean')
+            X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=features, index=X_train.index)
+            X_test = pd.DataFrame(imputer.transform(X_test), columns=features, index=X_test.index)
+            st.info("ℹ️ Missing values imputed with training-set means.")
+
+        if st.session_state.pipeline.get('scale_features', True):
+            scaler = StandardScaler()
+            X_train = pd.DataFrame(scaler.fit_transform(X_train), columns=features, index=X_train.index)
+            X_test = pd.DataFrame(scaler.transform(X_test), columns=features, index=X_test.index)
+            st.info("ℹ️ Features standardized using training-set statistics.")
         
         st.session_state.pipeline['X_train'] = X_train
         st.session_state.pipeline['X_test'] = X_test
@@ -1170,9 +1181,13 @@ def model_training_step():
             st.subheader("Model Details")
             st.write(f"**{model_type}**")
             if model_type in ["Linear Regression", "Logistic Regression"] and hasattr(model, 'coef_'):
+                # Binary logistic regression stores coef_ with shape (1, n_features);
+                # take the first row so this works for both regressors and classifiers.
+                coefs = np.atleast_2d(model.coef_)[0]
+                intercept_val = np.atleast_1d(model.intercept_)[0]
                 coef_df = pd.DataFrame({
                     'Feature': ['Intercept'] + st.session_state.pipeline['features'],
-                    'Coefficient': [model.intercept_] + list(model.coef_)
+                    'Coefficient': [intercept_val] + list(coefs)
                 })
                 st.dataframe(coef_df)
             elif model_type == "K-Nearest Neighbors":
@@ -1205,23 +1220,59 @@ def evaluation_step():
             y_preds[model_type] = y_pred
         
         st.session_state.pipeline['y_preds'] = y_preds
-        
+
+        # Classifiers and regressors need different metrics:
+        # R²/RMSE on class labels is meaningless, so use accuracy/F1 + confusion matrix.
+        trained_model = list(models.values())[0]
+        is_classifier = isinstance(trained_model, (LogisticRegression, KNeighborsClassifier))
+
         st.subheader("Model Performance Metrics")
-        metrics_df = pd.DataFrame(columns=['Model', 'RMSE', 'R²'])
-        for model_type, y_pred in y_preds.items():
-            mse = mean_squared_error(y_test, y_pred)
-            rmse = np.sqrt(mse)
-            r2 = r2_score(y_test, y_pred)
-            metrics_df = pd.concat([metrics_df, pd.DataFrame({
-                'Model': [model_type],
-                'RMSE': [rmse],
-                'R²': [r2]
-            })], ignore_index=True)
+        if is_classifier:
+            metrics_df = pd.DataFrame(columns=['Model', 'Accuracy', 'F1 (weighted)'])
+            for model_type, y_pred in y_preds.items():
+                metrics_df = pd.concat([metrics_df, pd.DataFrame({
+                    'Model': [model_type],
+                    'Accuracy': [accuracy_score(y_test, y_pred)],
+                    'F1 (weighted)': [f1_score(y_test, y_pred, average='weighted', zero_division=0)],
+                })], ignore_index=True)
+            st.dataframe(metrics_df.style.format({'Accuracy': '{:.4f}', 'F1 (weighted)': '{:.4f}'}))
+
+            st.subheader("Confusion Matrix")
+            for model_type, y_pred in y_preds.items():
+                cm = confusion_matrix(y_test, y_pred)
+                labels = sorted(pd.Series(y_test).astype(str).unique().tolist())
+                fig = px.imshow(
+                    cm,
+                    text_auto=True,
+                    x=labels,
+                    y=labels,
+                    labels=dict(x="Predicted", y="Actual"),
+                    title=f'Confusion Matrix — {model_type}',
+                    color_continuous_scale='Blues',
+                )
+                fig.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font_color='#e0e0e0',
+                )
+                st.plotly_chart(fig)
+        else:
+            metrics_df = pd.DataFrame(columns=['Model', 'RMSE', 'R²'])
+            for model_type, y_pred in y_preds.items():
+                mse = mean_squared_error(y_test, y_pred)
+                rmse = np.sqrt(mse)
+                r2 = r2_score(y_test, y_pred)
+                metrics_df = pd.concat([metrics_df, pd.DataFrame({
+                    'Model': [model_type],
+                    'RMSE': [rmse],
+                    'R²': [r2]
+                })], ignore_index=True)
+
+            st.dataframe(metrics_df.style.format({'RMSE': '{:.4f}', 'R²': '{:.4f}'}))
         
-        st.dataframe(metrics_df.style.format({'RMSE': '{:.4f}', 'R²': '{:.4f}'}))
-        
-        st.subheader("Actual vs Predicted Values")
-        fig = go.Figure()
+        if not is_classifier:
+            st.subheader("Actual vs Predicted Values")
+            fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=y_test,
             y=y_test,
@@ -1289,7 +1340,7 @@ def results_visualization_step():
             model = st.session_state.pipeline['models'][model_type]
             
             if model_type in ["Linear Regression", "Logistic Regression"] and hasattr(model, 'coef_'):
-                importance = np.abs(model.coef_)
+                importance = np.abs(np.atleast_2d(model.coef_)[0])
                 importance_df = pd.DataFrame({
                     'Feature': features,
                     'Importance': importance
@@ -1531,6 +1582,8 @@ def results_visualization_step():
             'y_preds': {},
             'current_price': None,
             'last_symbol': None,
+            'needs_imputation': False,
+            'scale_features': True,
         }
         st.session_state.theme = current_theme
         st.rerun()
